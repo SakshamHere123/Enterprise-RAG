@@ -1,0 +1,392 @@
+Complete Setup, Run Guide & Full Code Reference
+
+PART A — Running the System From Absolute Scratch
+Step 1: Navigate to the project folder
+bashcd enterprise-rag
+Step 2: Create a virtual environment
+A virtual environment isolates this project's Python packages from your system-wide Python, so dependencies don't conflict with other projects.
+bashpython -m venv venv
+This creates a venv/ folder containing an isolated Python installation.
+Step 3: Activate the virtual environment
+On Windows:
+bashvenv\Scripts\activate
+On macOS/Linux:
+bashsource venv/bin/activate
+Expect: your terminal prompt now shows (venv) at the start of the line — confirming you're inside the isolated environment. From now on, anything you pip install only affects this project.
+Step 4: Install all dependencies
+bashpip install -r requirements.txt
+Expect: several minutes of download/install logs, ending cleanly with no red errors.
+Step 5: Add your OpenAI API key
+Open the .env file and replace the placeholder:
+OPENAI_API_KEY=sk-your-real-key-here
+Step 6: Add documents
+Place your PDF/.docx/.txt files into data/raw/ (the sample company_handbook.txt is already there if you want to test immediately).
+Step 7: Build the vector index
+bashpython -m src.embed_store
+Expect:
+📄 Loading company_handbook.txt...
+✅ Loaded 1 raw document sections from 1 files.
+✅ Split into 7 chunks (chunk_size=1000, overlap=150).
+🔢 Embedding 7 chunks using text-embedding-3-small...
+✅ FAISS index built and saved to .../vectorstore/faiss_index
+Step 8: Start the backend (Terminal 1)
+bashpython app.py
+Expect:
+INFO:     Uvicorn running on http://0.0.0.0:8000
+Keep this terminal running. Verify in a browser: http://localhost:8000 → should show {"status":"ok",...}.
+Step 9: Start the frontend (Terminal 2 — new terminal, activate venv here too)
+bashcd enterprise-rag
+source venv/bin/activate     # or venv\Scripts\activate on Windows
+streamlit run frontend/streamlit_app.py
+Expect: browser opens automatically to http://localhost:8501 showing the chat UI.
+Step 10: Use it
+Type questions in the chat box. Use the "🔄 Reindex documents" button in the sidebar whenever you add new files to data/raw/.
+Step 11: When done — deactivate the environment
+bashdeactivate
+Quick command summary (for your notes)
+bashcd enterprise-rag
+python -m venv venv
+source venv/bin/activate          # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+# add OPENAI_API_KEY to .env
+# add files to data/raw/
+python -m src.embed_store
+
+# Terminal 1
+python app.py
+
+# Terminal 2
+source venv/bin/activate
+streamlit run frontend/streamlit_app.py
+
+PART B — Full Code Reference (for interview prep)
+requirements.txt
+langchain==0.3.7
+langchain-community==0.3.7
+langchain-openai==0.2.9
+faiss-cpu==1.9.0
+openai==1.55.3
+pypdf==5.1.0
+python-dotenv==1.0.1
+fastapi==0.115.5
+uvicorn==0.32.1
+streamlit==1.40.1
+tiktoken==0.8.0
+requests==2.32.3
+src/config.py
+pythonimport os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY not found. Add it to your .env file.")
+
+EMBEDDING_MODEL = "text-embedding-3-small"
+CHAT_MODEL = "gpt-4o-mini"
+
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 150
+
+TOP_K = 4
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RAW_DATA_DIR = os.path.join(BASE_DIR, "data", "raw")
+VECTORSTORE_DIR = os.path.join(BASE_DIR, "vectorstore")
+src/ingest.py
+pythonimport os
+from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from src.config import RAW_DATA_DIR, CHUNK_SIZE, CHUNK_OVERLAP
+
+LOADER_MAP = {
+    ".pdf": PyPDFLoader,
+    ".txt": TextLoader,
+    ".docx": Docx2txtLoader,
+}
+
+def load_documents(raw_dir: str = RAW_DATA_DIR):
+    documents = []
+    if not os.path.exists(raw_dir):
+        raise FileNotFoundError(f"Raw data directory not found: {raw_dir}")
+
+    files = os.listdir(raw_dir)
+    if not files:
+        print(f"⚠️  No files found in {raw_dir}.")
+        return documents
+
+    for filename in files:
+        filepath = os.path.join(raw_dir, filename)
+        ext = os.path.splitext(filename)[1].lower()
+        loader_class = LOADER_MAP.get(ext)
+        if loader_class is None:
+            print(f"⚠️  Skipping unsupported file type: {filename}")
+            continue
+        print(f"📄 Loading {filename}...")
+        loader = loader_class(filepath)
+        docs = loader.load()
+        for doc in docs:
+            doc.metadata["source"] = filename
+        documents.extend(docs)
+
+    print(f"✅ Loaded {len(documents)} raw document sections from {len(files)} files.")
+    return documents
+
+def split_documents(documents):
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+    chunks = splitter.split_documents(documents)
+    print(f"✅ Split into {len(chunks)} chunks (chunk_size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}).")
+    return chunks
+
+def run_ingestion():
+    documents = load_documents()
+    if not documents:
+        return []
+    return split_documents(documents)
+
+if __name__ == "__main__":
+    chunks = run_ingestion()
+    if chunks:
+        print("\n--- Sample chunk ---")
+        print(f"Source: {chunks[0].metadata.get('source')}")
+        print(f"Content: {chunks[0].page_content[:300]}...")
+src/embed_store.py
+pythonimport os
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from src.config import OPENAI_API_KEY, EMBEDDING_MODEL, VECTORSTORE_DIR
+from src.ingest import run_ingestion
+
+INDEX_NAME = "faiss_index"
+
+def get_embedding_model():
+    return OpenAIEmbeddings(model=EMBEDDING_MODEL, openai_api_key=OPENAI_API_KEY)
+
+def build_vectorstore(chunks):
+    embeddings = get_embedding_model()
+    print(f"🔢 Embedding {len(chunks)} chunks using {EMBEDDING_MODEL}...")
+    vectorstore = FAISS.from_documents(chunks, embeddings)
+    os.makedirs(VECTORSTORE_DIR, exist_ok=True)
+    save_path = os.path.join(VECTORSTORE_DIR, INDEX_NAME)
+    vectorstore.save_local(save_path)
+    print(f"✅ FAISS index built and saved to {save_path}")
+    return vectorstore
+
+def load_vectorstore():
+    save_path = os.path.join(VECTORSTORE_DIR, INDEX_NAME)
+    if not os.path.exists(save_path):
+        raise FileNotFoundError(f"No saved index at {save_path}. Run `python -m src.embed_store` first.")
+    embeddings = get_embedding_model()
+    vectorstore = FAISS.load_local(save_path, embeddings, allow_dangerous_deserialization=True)
+    print(f"✅ Loaded FAISS index from {save_path}")
+    return vectorstore
+
+def run_embedding_pipeline():
+    chunks = run_ingestion()
+    if not chunks:
+        print("❌ No chunks to embed. Add files to data/raw/ first.")
+        return None
+    return build_vectorstore(chunks)
+
+if __name__ == "__main__":
+    run_embedding_pipeline()
+src/retriever.py
+pythonfrom src.embed_store import load_vectorstore
+from src.config import TOP_K
+
+def get_retriever(k: int = TOP_K, search_type: str = "similarity"):
+    vectorstore = load_vectorstore()
+    return vectorstore.as_retriever(search_type=search_type, search_kwargs={"k": k})
+
+def retrieve_chunks(query: str, k: int = TOP_K):
+    retriever = get_retriever(k=k)
+    return retriever.invoke(query)
+
+if __name__ == "__main__":
+    test_query = input("Enter a test query: ")
+    results = retrieve_chunks(test_query)
+    print(f"\n🔍 Top {len(results)} matches for: \"{test_query}\"\n")
+    for i, doc in enumerate(results, 1):
+        print(f"--- Match {i} (source: {doc.metadata.get('source')}) ---")
+        print(doc.page_content[:300])
+        print()
+src/qa_chain.py
+pythonfrom langchain_openai import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+from src.config import OPENAI_API_KEY, CHAT_MODEL
+from src.retriever import get_retriever
+
+PROMPT_TEMPLATE = """You are a knowledgeable enterprise assistant. Answer the
+user's question using ONLY the context provided below. 
+
+Rules:
+- If the context does not contain enough information to answer, say so
+  honestly instead of guessing or using outside knowledge.
+- Be concise and precise — this is for technical/business use, not casual chat.
+- When relevant, mention which source document(s) the information came from.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:"""
+
+def format_docs(docs):
+    formatted = []
+    for doc in docs:
+        source = doc.metadata.get("source", "unknown")
+        formatted.append(f"[Source: {source}]\n{doc.page_content}")
+    return "\n\n---\n\n".join(formatted)
+
+def build_qa_chain():
+    retriever = get_retriever()
+    llm = ChatOpenAI(model=CHAT_MODEL, openai_api_key=OPENAI_API_KEY, temperature=0)
+    prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
+    chain = (
+        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        | prompt | llm | StrOutputParser()
+    )
+    return chain
+
+def ask(question: str) -> str:
+    chain = build_qa_chain()
+    return chain.invoke(question)
+
+def ask_with_sources(question: str):
+    retriever = get_retriever()
+    docs = retriever.invoke(question)
+    context = format_docs(docs)
+    llm = ChatOpenAI(model=CHAT_MODEL, openai_api_key=OPENAI_API_KEY, temperature=0)
+    prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
+    parser = StrOutputParser()
+    chain = prompt | llm | parser
+    answer = chain.invoke({"context": context, "question": question})
+    sources = list({doc.metadata.get("source", "unknown") for doc in docs})
+    return {"answer": answer, "sources": sources, "chunks_used": len(docs)}
+
+if __name__ == "__main__":
+    q = input("Ask a question about your documents: ")
+    result = ask_with_sources(q)
+    print(f"\n💬 Answer:\n{result['answer']}")
+    print(f"\n📚 Sources: {', '.join(result['sources'])}")
+app.py
+pythonfrom fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from src.qa_chain import ask_with_sources
+from src.embed_store import run_embedding_pipeline
+
+app = FastAPI(title="Enterprise RAG API", version="1.0")
+
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
+
+class QueryRequest(BaseModel):
+    question: str
+
+class QueryResponse(BaseModel):
+    answer: str
+    sources: list[str]
+    chunks_used: int
+
+@app.get("/")
+def health_check():
+    return {"status": "ok", "message": "Enterprise RAG API is running"}
+
+@app.post("/query", response_model=QueryResponse)
+def query(request: QueryRequest):
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
+    try:
+        return ask_with_sources(request.question)
+    except FileNotFoundError:
+        raise HTTPException(status_code=400, detail="No vector index found. Run /reindex first.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/reindex")
+def reindex():
+    try:
+        vectorstore = run_embedding_pipeline()
+        if vectorstore is None:
+            raise HTTPException(status_code=400, detail="No documents found in data/raw/")
+        return {"status": "ok", "message": "Reindexing complete"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+frontend/streamlit_app.py
+pythonimport streamlit as st
+import requests
+
+API_URL = "http://localhost:8000"
+
+st.set_page_config(page_title="Enterprise Knowledge Worker", page_icon="🧠", layout="centered")
+st.title("🧠 Enterprise Knowledge Worker")
+st.caption("Ask questions about your internal documents — answers are grounded in retrieved context.")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+with st.sidebar:
+    st.header("⚙️ Controls")
+    st.write("Add files to `data/raw/`, then click below to index them.")
+    if st.button("🔄 Reindex documents"):
+        with st.spinner("Embedding documents and building FAISS index..."):
+            try:
+                resp = requests.post(f"{API_URL}/reindex", timeout=300)
+                if resp.status_code == 200:
+                    st.success("Index rebuilt successfully!")
+                else:
+                    st.error(f"Failed: {resp.json().get('detail')}")
+            except requests.exceptions.ConnectionError:
+                st.error("Can't reach the API. Is `app.py` running on port 8000?")
+    st.divider()
+    st.caption("Stack: LangChain · FAISS · OpenAI · FastAPI · Streamlit")
+
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        if msg.get("sources"):
+            st.caption(f"📚 Sources: {', '.join(msg['sources'])}")
+
+if question := st.chat_input("Ask a question about your documents..."):
+    st.session_state.messages.append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.markdown(question)
+    with st.chat_message("assistant"):
+        with st.spinner("Searching documents and generating answer..."):
+            try:
+                resp = requests.post(f"{API_URL}/query", json={"question": question}, timeout=60)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    st.markdown(data["answer"])
+                    if data["sources"]:
+                        st.caption(f"📚 Sources: {', '.join(data['sources'])}")
+                    st.session_state.messages.append({
+                        "role": "assistant", "content": data["answer"], "sources": data["sources"]
+                    })
+                else:
+                    st.error(resp.json().get("detail", "Unknown error"))
+            except requests.exceptions.ConnectionError:
+                st.error("Can't reach the API. Make sure `app.py` is running (`python app.py`).")
+
+PART C — Interview Talking Points (quick mental checklist)
+Before your interview, be able to answer these in your own words:
+
+"Walk me through what happens when a user asks a question." → question typed in Streamlit → POST to FastAPI /query → question embedded → FAISS similarity search returns top-4 chunks → chunks inserted into prompt template → GPT-4o-mini generates answer → response with sources sent back → rendered in chat UI.
+"Why FAISS over a regular database?" → vector similarity search needs to compare high-dimensional vectors fast; FAISS is purpose-built for nearest-neighbor search at scale, unlike SQL which can't do semantic comparison.
+"How do you reduce hallucination?" → constrained prompt template explicitly forcing the model to answer only from retrieved context and admit uncertainty, plus temperature=0 for deterministic output.
+"What's chunking and why does it matter?" → splitting documents into small overlapping pieces so each embedding represents one focused idea, improving retrieval precision (this maps directly to your "+30% precision" resume claim).
+"Why separate ingestion/embedding from retrieval/generation?" → ingestion+embedding is expensive and infrequent (run once per doc set); retrieval+generation is cheap and runs on every query — separating them avoids unnecessary recomputation.
